@@ -1,0 +1,42 @@
+# Python-specific files and directories
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+venv/
+.env
+build/
+dist/
+*.egg-info/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# macOS-specific files
+.DS_Store
+.Trashes
+._*
+.Spotlight-V100
+.TemporaryItems
+.fseventsd
+
+# IDE/Editor-specific files (e.g., VS Code, PyCharm)
+.vscode/
+.idea/
+*.iml
+
+# Test and coverage files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and temporary files
+*.log
+tmp/
