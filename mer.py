@@ -14,7 +14,7 @@ import scipy.signal
 CONFIG = {
     "face_backend": "opencv",  # "opencv" (fast) or "retinaface" (accurate)
     "face_detection_interval": 0.5,  # seconds between face detections
-    "audio_processing_interval": 2.0,  # Reduced to 2 seconds for more responsive audio
+    "audio_processing_interval": 1.5,  # Reduced to 1.5 seconds for more responsive audio
     "use_gpu": True,  # Use GPU if available
     "resize_for_face_detection": True,  # Resize frames for faster face detection
     "adaptive_frame_skip": True,  # Skip frames when FPS is low
@@ -40,6 +40,7 @@ FACE_EMOTION_MAP = {
 }
 
 AUDIO_EMOTION_MAP = {
+    # Original model mappings
     "angry": "anger",
     "anger": "anger",
     "disgust": "disgust", 
@@ -51,10 +52,42 @@ AUDIO_EMOTION_MAP = {
     "sadness": "sadness",
     "surprise": "surprise",
     "neutral": "neutral",
-    "calm": "neutral",
+    
+    # SuperB model mappings (more reliable)
+    "ang": "anger",      # anger
+    "hap": "happiness",  # happiness  
+    "neu": "neutral",    # neutral
+    "sad": "sadness",    # sadness
+    
+    # Additional common variations
+    "fearful": "fear",
+    "joyful": "happiness",
 }
 
-# Audio confidence thresholds to improve accuracy
+# Model-specific emotion processing
+def process_audio_emotions(predictions, model_name):
+    """Process audio emotion predictions based on the model used"""
+    
+    if "superb" in model_name.lower():
+        # SuperB model gives more confident predictions, use different thresholds
+        filtered_preds = []
+        for pred in predictions:
+            if pred["score"] > 0.05:  # Lower threshold for SuperB model
+                emotion = AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"])
+                filtered_preds.append({"label": emotion, "score": pred["score"]})
+        
+        # Sort by confidence
+        filtered_preds.sort(key=lambda x: x["score"], reverse=True)
+        return filtered_preds if filtered_preds else [{"label": "neutral", "score": 0.5}]
+    
+    else:
+        # Original model processing (less confident predictions)
+        filtered_preds = []
+        for pred in predictions:
+            emotion = AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"])
+            filtered_preds.append({"label": emotion, "score": pred["score"]})
+        
+        return filtered_preds# Audio confidence thresholds to improve accuracy
 AUDIO_CONFIDENCE_THRESHOLD = 0.1  # Much lower threshold to accept more predictions
 EMOTION_SIMILARITY_MAP = {
     # Map similar emotions that might be confused
@@ -110,23 +143,35 @@ for key, value in CONFIG.items():
 print("=================================")
 
 print("Loading speech emotion model (wav2vec2)...")
-# Using a smaller, faster model for better performance
-# You can switch back to the original for better accuracy if needed
-try:
-    use_gpu = CONFIG["use_gpu"] and __import__("torch").cuda.is_available()
-    audio_classifier = pipeline(
-        "audio-classification",
-        model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
-        device=0 if use_gpu else -1
-    )
-    print(f"Audio model loaded on {'GPU' if use_gpu else 'CPU'}")
-except:
-    print("Failed to load on GPU, falling back to CPU")
-    audio_classifier = pipeline(
-        "audio-classification",
-        model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
-        device=-1
-    )
+# Try multiple models in order of preference
+audio_classifier = None
+current_audio_model = None
+models_to_try = [
+    ("superb/wav2vec2-base-superb-er", "SuperB emotion recognition model"),
+    ("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", "Original emotion model"),
+]
+
+use_gpu = CONFIG["use_gpu"] and __import__("torch").cuda.is_available()
+device = 0 if use_gpu else -1
+
+for model_name, description in models_to_try:
+    try:
+        print(f"Trying {description}...")
+        audio_classifier = pipeline(
+            "audio-classification",
+            model=model_name,
+            device=device
+        )
+        print(f"✓ {description} loaded successfully on {'GPU' if use_gpu else 'CPU'}")
+        current_audio_model = model_name
+        break
+    except Exception as e:
+        print(f"✗ Failed to load {description}: {e}")
+        continue
+
+if audio_classifier is None:
+    print("ERROR: Could not load any audio emotion model!")
+    exit(1)
 
 print("Loading face detector...")
 # Use configurable backend for balance between speed and accuracy
@@ -239,9 +284,14 @@ def audio_worker():
                     if CONFIG["audio_enhancement"]:
                         processed_segment = preprocess_audio(segment)
                     else:
-                        # Simple normalization only
+                        # Simple normalization only - more reliable
                         max_val = np.max(np.abs(segment))
-                        processed_segment = segment / (max_val + 1e-8) if max_val > 1e-8 else segment
+                        if max_val > 1e-8:
+                            processed_segment = segment / max_val
+                            # Ensure audio is in the right range for the model
+                            processed_segment = np.clip(processed_segment, -1.0, 1.0)
+                        else:
+                            processed_segment = segment
                 except Exception as filter_error:
                     print(f"Audio preprocessing error: {filter_error}")
                     # Fallback to simple normalization
@@ -251,87 +301,97 @@ def audio_worker():
                 # Calculate audio statistics for debugging
                 audio_volume = np.sqrt(np.mean(processed_segment**2))
                 audio_energy = np.sum(processed_segment**2)
+                audio_peak = np.max(np.abs(processed_segment))
                 
-                # Skip if audio is too quiet (no actual speech)
-                if audio_volume < 0.001:
+                # Improved audio quality detection
+                # Check for actual speech characteristics
+                is_speech_like = (
+                    audio_volume > 0.002 and  # Minimum volume threshold
+                    audio_peak > 0.01 and    # Minimum peak amplitude
+                    audio_energy > 0.1       # Minimum energy
+                )
+                
+                if not is_speech_like:
                     if CONFIG["audio_debug"]:
-                        print(f"Audio too quiet: {audio_volume:.6f}")
-                    # Don't update audio label if too quiet
+                        print(f"Audio quality insufficient - Volume: {audio_volume:.6f}, Peak: {audio_peak:.4f}, Energy: {audio_energy:.4f}")
+                    # Don't update audio label if quality is too poor
                     processing_time = time.time() - start_time
                     performance_stats["audio_processing_time"].append(processing_time)
                     last_pred_time = now
                     return
                 
-                # Get predictions
-                preds = audio_classifier(processed_segment, top_k=5)  # Get top 5 for better analysis
+                # Get predictions with error handling
+                try:
+                    raw_preds = audio_classifier(processed_segment, top_k=5)
+                    preds = process_audio_emotions(raw_preds, current_audio_model)
+                except Exception as model_error:
+                    print(f"Audio model error: {model_error}")
+                    return
                 
                 if CONFIG["audio_debug"]:
                     print(f"\n=== AUDIO DEBUG ===")
-                    print(f"Volume: {audio_volume:.4f}, Energy: {audio_energy:.2f}")
-                    print(f"All predictions:")
+                    print(f"Model: {current_audio_model}")
+                    print(f"Volume: {audio_volume:.4f}, Peak: {audio_peak:.4f}, Energy: {audio_energy:.2f}")
+                    print(f"Raw predictions:")
+                    for i, pred in enumerate(raw_preds):
+                        print(f"  {i+1}. {pred['label']} (confidence: {pred['score']:.3f})")
+                    print(f"Processed predictions:")
                     for i, pred in enumerate(preds):
-                        emotion = AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"])
-                        print(f"  {i+1}. {pred['label']} -> {emotion} (confidence: {pred['score']:.3f})")
+                        print(f"  {i+1}. {pred['label']} (confidence: {pred['score']:.3f})")
                 
-                if CONFIG["simple_mode"]:
-                    # Simple mode: just use the top prediction with very low threshold
-                    top_pred = preds[0]
-                    mapped = AUDIO_EMOTION_MAP.get(top_pred["label"].lower(), "neutral")
-                    confidence = top_pred["score"]
-                    
-                    # If top is neutral, try the second prediction
-                    if mapped == "neutral" and len(preds) > 1:
-                        second_pred = preds[1]
-                        if second_pred["score"] > 0.1:  # Very low threshold
-                            mapped = AUDIO_EMOTION_MAP.get(second_pred["label"].lower(), "neutral")
-                            confidence = second_pred["score"]
-                            if CONFIG["audio_debug"]:
-                                print(f"SIMPLE MODE: Using second prediction {mapped}")
-                
+                # Determine final emotion with bias against neutral
+                if not preds:
+                    mapped = "neutral"
+                    confidence = 0.5
                 else:
-                    # Complex mode (original logic)
-                    # Get the top prediction
                     top_pred = preds[0]
+                    mapped = top_pred["label"]
                     confidence = top_pred["score"]
-                    label = top_pred["label"].lower()
-                    mapped = AUDIO_EMOTION_MAP.get(label, "neutral")
                     
-                    # If top prediction is neutral but there are other emotions, consider them
-                    if mapped == "neutral" and len(preds) > 1:
-                        for pred in preds[1:3]:  # Check next 2 predictions
-                            pred_label = pred["label"].lower()
-                            pred_mapped = AUDIO_EMOTION_MAP.get(pred_label, "neutral")
-                            if pred_mapped != "neutral" and pred["score"] > 0.15:  # Very low threshold
-                                mapped = pred_mapped
-                                confidence = pred["score"]
+                    # For SuperB model, trust high confidence predictions more
+                    if "superb" in current_audio_model.lower():
+                        # SuperB model bias: prefer non-neutral emotions when they're reasonably confident
+                        if confidence > 0.6:  # High confidence
+                            pass  # Use as-is
+                        elif mapped == "neutral" and len(preds) > 1:
+                            # If neutral is top but a non-neutral emotion has good confidence, prefer it
+                            second_pred = preds[1]
+                            if second_pred["score"] > 0.15 and second_pred["label"] != "neutral":
+                                mapped = second_pred["label"]
+                                confidence = second_pred["score"]
                                 if CONFIG["audio_debug"]:
-                                    print(f"OVERRIDING NEUTRAL: Using {pred_mapped} instead")
-                                break
+                                    print(f"ANTI-NEUTRAL BIAS: Using {mapped} instead of neutral (conf: {confidence:.3f})")
+                        elif confidence > 0.3 and mapped != "neutral":  # Medium confidence, non-neutral
+                            pass  # Use as-is
                     
-                    # Enhanced emotion analysis - look at multiple predictions
-                    emotion_scores = {}
-                    for pred in preds[:5]:
-                        pred_label = pred["label"].lower()
-                        mapped_emotion = AUDIO_EMOTION_MAP.get(pred_label, "neutral")
-                        if mapped_emotion not in emotion_scores:
-                            emotion_scores[mapped_emotion] = 0
-                        emotion_scores[mapped_emotion] += pred["score"]
-                    
-                    # Find non-neutral emotion with highest combined score
-                    non_neutral_emotions = {k: v for k, v in emotion_scores.items() if k != "neutral"}
-                    if non_neutral_emotions:
-                        best_emotion = max(non_neutral_emotions, key=non_neutral_emotions.get)
-                        best_score = non_neutral_emotions[best_emotion]
-                        
-                        # Use non-neutral emotion if it has reasonable score
-                        if best_score > 0.2 and (mapped == "neutral" or best_score > confidence):
-                            if CONFIG["audio_debug"]:
-                                print(f"PREFERRING NON-NEUTRAL: {best_emotion} (score: {best_score:.3f})")
-                            mapped = best_emotion
-                            confidence = best_score
-                    
-                    if CONFIG["audio_debug"]:
-                        print(f"Emotion scores: {emotion_scores}")
+                    else:
+                        # Original model logic (less confident predictions)
+                        if CONFIG["simple_mode"]:
+                            # Simple mode: just use the top prediction with low threshold
+                            if mapped == "neutral" and len(preds) > 1:
+                                second_pred = preds[1]
+                                if second_pred["score"] > 0.1:  # Very low threshold
+                                    mapped = second_pred["label"]
+                                    confidence = second_pred["score"]
+                        else:
+                            # Complex mode with emotion aggregation
+                            emotion_scores = {}
+                            for pred in preds[:5]:
+                                emotion = pred["label"]
+                                if emotion not in emotion_scores:
+                                    emotion_scores[emotion] = 0
+                                emotion_scores[emotion] += pred["score"]
+                            
+                            # Find non-neutral emotion with highest combined score
+                            non_neutral_emotions = {k: v for k, v in emotion_scores.items() if k != "neutral"}
+                            if non_neutral_emotions:
+                                best_emotion = max(non_neutral_emotions, key=non_neutral_emotions.get)
+                                best_score = non_neutral_emotions[best_emotion]
+                                
+                                # Use non-neutral emotion if it has reasonable score
+                                if best_score > 0.15 and (mapped == "neutral" or best_score > confidence):
+                                    mapped = best_emotion
+                                    confidence = best_score
                 
                 # Always show final decision
                 if CONFIG["audio_debug"]:
@@ -340,10 +400,13 @@ def audio_worker():
                 with audio_lock:
                     audio_label["value"] = mapped
                     audio_label["confidence"] = confidence
-                    audio_label["raw_predictions"] = [(p["label"], p["score"]) for p in preds[:5]]
+                    audio_label["raw_predictions"] = [(p["label"], p["score"]) for p in raw_preds]
+                    audio_label["processed_predictions"] = [(p["label"], p["score"]) for p in preds]
                     audio_label["audio_stats"] = {
                         "volume": audio_volume,
                         "energy": audio_energy,
+                        "peak": audio_peak,
+                        "is_speech_like": is_speech_like,
                     }
                 
                 # Track performance
