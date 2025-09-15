@@ -9,8 +9,9 @@ This is a simple **multimodal emotion recognition prototype** that combines **fa
 ```bash
 git clone https://github.com/yourusername/empathy_mer.git
 cd empathy_mer
+```
 
-### 2. Clone repository
+### 2. Create Virtual Environment
 python3 -m venv multimodal-env
 source multimodal-env/bin/activate   # macOS/Linux
 multimodal-env\Scripts\activate      # Windows (PowerShell)
