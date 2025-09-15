@@ -12,13 +12,19 @@ cd empathy_mer
 ```
 
 ### 2. Create Virtual Environment
+```bash
 python3 -m venv multimodal-env
 source multimodal-env/bin/activate   # macOS/Linux
 multimodal-env\Scripts\activate      # Windows (PowerShell)
+```
 
 ### 3. Install dependencies
+```bash
 pip install --upgrade pip
 pip install -r requirements.txt
+```
 
 ### 4. Run the prototype:
+```bash
 python mer.py
+```
