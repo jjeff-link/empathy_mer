@@ -7,7 +7,7 @@ This is a simple **multimodal emotion recognition prototype** that combines **fa
 
 ### 1. Clone repository
 ```bash
-git clone https://github.com/yourusername/empathy_mer.git
+git clone https://github.com/jjeff-link/empathy_mer.git
 cd empathy_mer
 ```
 
