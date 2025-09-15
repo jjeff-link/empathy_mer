@@ -18,7 +18,41 @@ SAMPLE_RATE = 16000
 CHUNK = 1024
 AUDIO_DURATION = 2.0      # seconds of audio per prediction
 VIDEO_FPS = 15            # sample video every N frames
-EMOTION_LABELS = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+
+# Mapping from various emotion labels to standardized Ekman emotions
+EMOTION_MAPPING = {
+    # DeepFace variants
+    'angry': 'anger',
+    'surprised': 'surprise',
+    'fearful': 'fear',
+    'happy': 'happy',
+    'sad': 'sad',
+    'disgusted': 'disgust',
+    # RAVDESS variants
+    'calm': 'neutral',
+    'ps': 'surprise',
+    # Standard forms
+    'anger': 'anger',
+    'disgust': 'disgust',
+    'fear': 'fear',
+    'surprise': 'surprise',
+    'neutral': 'neutral',
+    'happiness': 'happy'
+}
+
+# Ekman's six basic emotions plus neutral
+EKMAN_EMOTIONS = {
+    'anger': 0,    # anger
+    'disgust': 1,  # disgust
+    'fear': 2,     # fear
+    'happy': 3,    # happiness
+    'sad': 4,      # sadness
+    'surprise': 5, # surprise
+    'neutral': 6   # neutral (additional)
+}
+
+# List version for indexing
+EMOTION_LABELS = list(EKMAN_EMOTIONS.keys())
 
 # ======================
 # LOAD MODELS (ONCE)
@@ -26,70 +60,138 @@ EMOTION_LABELS = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutr
 
 # 1. FACIAL MODEL: DeepFace (auto-downloads on first run)
 print("Loading facial emotion model (DeepFace/VGG-Face)...")
-# Just call once to trigger download
-DeepFace.analyze(img_path=np.zeros((48,48,3), dtype=np.uint8), actions=['emotion'], enforce_detection=False, silent=True)
 
-# 2. SPEECH MODEL: Wav2Vec 2.0 Processor + Feature Extractor
-print("Loading Wav2Vec 2.0 processor and model...")
-processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
-wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
-wav2vec_model.eval()  # Set to inference mode
+# Initialize DeepFace with configuration for reuse
+deepface_config = {
+    'detector_backend': 'opencv',
+    'enforce_detection': False,
+    'silent': True,
+    'actions': ['emotion']
+}
 
-# Freeze Wav2Vec parameters
-for param in wav2vec_model.parameters():
-    param.requires_grad = False
+# Function to safely analyze frame
+def deepface_analyzer(frame):
+    try:
+        # Ensure frame is valid
+        if frame is None or not isinstance(frame, np.ndarray):
+            print("Invalid frame format")
+            return None
+            
+        # Ensure frame is BGR (DeepFace expects BGR)
+        if len(frame.shape) != 3 or frame.shape[2] != 3:
+            print("Invalid frame dimensions")
+            return None
+            
+        # Save frame temporarily
+        temp_path = "temp_frame.jpg"
+        cv2.imwrite(temp_path, frame)
+            
+        # Analyze with DeepFace using file path
+        try:
+            result = DeepFace.analyze(
+                img_path=temp_path,
+                actions=['emotion'],
+                enforce_detection=False,
+                detector_backend='opencv',
+                silent=True
+            )
+            
+            # Clean up temp file
+            import os
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            
+            # Process result
+            if isinstance(result, list) and len(result) > 0:
+                return result[0]
+            elif isinstance(result, dict):
+                return result
+            else:
+                print("No valid face analysis result")
+                return None
+                
+        except Exception as inner_e:
+            print(f"DeepFace analysis error: {str(inner_e)}")
+            return None
+            
+    except Exception as e:
+        print(f"Frame processing error: {str(e)}")
+        return None
+        
+# Ensure models directory exists
+import os
+if not os.path.exists('models'):
+    os.makedirs('models')
 
-# 3. SPEECH CLASSIFIER: Load pre-trained weights
-class SpeechEmotionClassifier(torch.nn.Module):
-    def __init__(self, input_dim=768, num_classes=7):
-        super(SpeechEmotionClassifier, self).__init__()
-        self.conv1 = torch.nn.Conv1d(input_dim, 128, kernel_size=3, padding=1)
-        self.pool = torch.nn.AdaptiveAvgPool1d(1)
-        self.fc = torch.nn.Linear(128, num_classes)
-        self.dropout = torch.nn.Dropout(0.3)
+# Warm up DeepFace with dummy frame
+warmup_frame = np.zeros((224, 224, 3), dtype=np.uint8)  # Larger frame for better initialization
+_ = deepface_analyzer(warmup_frame)
 
-    def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = self.pool(x).squeeze(-1)
-        x = self.dropout(x)
-        return torch.softmax(self.fc(x), dim=-1)
+# 2. SPEECH MODEL: Wav2Vec 2.0 for Speech Emotion Recognition
+print("Loading Wav2Vec 2.0 Speech Emotion Recognition model...")
+from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+from transformers import Wav2Vec2Model
 
-speech_classifier = SpeechEmotionClassifier()
-try:
-    speech_classifier.load_state_dict(torch.load("models/speech_emotion_classifier.pth", map_location='cpu', weights_only=False))
-    speech_classifier.eval()
-    print("Loaded pre-trained speech emotion classifier.")
-except FileNotFoundError:
-    print("speech_emotion_classifier.pth not found! Download from:")
-    print("https://drive.google.com/uc?export=download&id=1ZqLd5QYpJhFt7jBbNwRlKxu3vXnHkDfE")
-    exit(1)
+# Load the pre-trained speech emotion recognition model and processor
+model_name = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+speech_model = AutoModelForAudioClassification.from_pretrained(model_name, output_hidden_states=True)
+speech_model.eval()  # Set to inference mode
 
-# 4. MULTIMODAL FUSION: Attention-based late fusion
+# Load base Wav2Vec2 model for embeddings
+base_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
+base_model.eval()
+
+# Define emotion mapping from RAVDESS (used in speech model) to Ekman
+id2label = speech_model.config.id2label
+SPEECH_EMOTION_LABELS = list(id2label.values())
+
+# Use the unified EMOTION_MAPPING for all conversions
+print("Initializing emotion recognition models:")
+
+print("Initializing emotion recognition models:")
+print(f"- Speech (RAVDESS): {SPEECH_EMOTION_LABELS}")
+print(f"- Unified (Ekman): {EMOTION_LABELS}")
+
+# 4. MULTIMODAL FUSION: Weighted Average Based on Confidence (Simple & Robust)
 class MultimodalFusion(nn.Module):
-    def __init__(self, face_dim=7, speech_dim=768, hidden_dim=128, num_classes=7):
+    def __init__(self, emotion_dim=len(EKMAN_EMOTIONS)):
         super(MultimodalFusion, self).__init__()
-        self.face_proj = nn.Linear(face_dim, hidden_dim)
-        self.speech_proj = nn.Linear(speech_dim, hidden_dim)
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-
+        self.emotion_dim = emotion_dim
+        # Learnable weights for face and speech (initialized to equal importance)
+        self.face_weight = nn.Parameter(torch.tensor([0.5]))
+        self.speech_weight = nn.Parameter(torch.tensor([0.5]))
+    
     def forward(self, face_feat, speech_feat):
-        face_emb = torch.relu(self.face_proj(face_feat))   # (B, 128)
-        speech_emb = torch.relu(self.speech_proj(speech_feat))  # (B, 128)
+        # Ensure inputs are [B, 7]
+        if face_feat.dim() == 1:
+            face_feat = face_feat.unsqueeze(0)
+        if speech_feat.dim() == 1:
+            speech_feat = speech_feat.unsqueeze(0)
+            
+        # Convert to float32
+        face_feat = face_feat.float()
+        speech_feat = speech_feat.float()
+            
+        # Normalize weights to sum to 1
+        total_weight = self.face_weight + self.speech_weight
+        w_face = self.face_weight / total_weight
+        w_speech = self.speech_weight / total_weight
+        
+        # Weighted average of emotion distributions
+        fused_dist = w_face * face_feat + w_speech * speech_feat
+        
+        # Return normalized distribution
+        return fused_dist / fused_dist.sum(dim=1, keepdim=True)
 
-        combined = torch.stack([face_emb, speech_emb], dim=1)  # (B, 2, 128)
-        attn_out, _ = self.attention(combined, combined, combined)
-        fused = attn_out.mean(dim=1)
-        logits = self.classifier(fused)
-        return torch.softmax(logits, dim=-1)
-
+# Initialize fusion model
 fusion_model = MultimodalFusion()
 
-# Load pre-trained fusion weights (dummy for now — trained on simulated data)
+# Save dummy weights (this will be learned during training — but for demo, we use equal weights)
 torch.save(fusion_model.state_dict(), "models/fusion_weights.pth")
 fusion_model.load_state_dict(torch.load("models/fusion_weights.pth", map_location='cpu'))
 fusion_model.eval()
-print("Loaded multimodal fusion model.")
+print("Loaded simple weighted fusion model.")
 
 # ======================
 # THREADING QUEUES
@@ -167,44 +269,100 @@ def predict_emotion():
 
             # 1. FACE EMOTION PREDICTION (DeepFace)
             try:
-                result = DeepFace.analyze(
-                    img_path=frame,
-                    actions=['emotion'],
-                    enforce_detection=False,
-                    detector_backend='opencv',
-                    silent=True
-                )
-                dominant_emotion = result[0]['dominant_emotion']
-                emotion_scores = result[0]['emotion']
-                face_conf = emotion_scores[dominant_emotion] / 100.0
-
-                # One-hot encode emotion for fusion (7-d vector)
-                face_idx = EMOTION_LABELS.index(dominant_emotion)
-                face_feat = np.eye(7)[face_idx].astype(np.float32)
-                face_tensor = torch.tensor(face_feat).unsqueeze(0)  # (1, 7)
-
+                # Get face analysis result (now returns single dict or None)
+                result_dict = deepface_analyzer(frame)
+                
+                if result_dict is None:
+                    raise ValueError("No face detected or invalid frame")
+                
+                if not isinstance(result_dict, dict):
+                    raise ValueError("Invalid result format")
+                
+                # Extract emotion data with defaults
+                dominant_emotion = result_dict.get('dominant_emotion', 'neutral')
+                emotion_scores = result_dict.get('emotion', {})
+                
+                # Ensure we have valid emotion scores
+                if not emotion_scores:
+                    raise ValueError("No emotion scores available")
+                
+                # Safely get confidence
+                face_conf = emotion_scores.get(dominant_emotion, 0.0) / 100.0
+                
+                # Map to Ekman emotion
+                face_emotion = EMOTION_MAPPING.get(dominant_emotion, 'neutral')
+                
+                # Create continuous feature vector from emotion scores
+                face_feat = np.zeros(len(EKMAN_EMOTIONS))
+                for emotion, score in emotion_scores.items():
+                    mapped_emotion = EMOTION_MAPPING.get(emotion, 'neutral')
+                    idx = EKMAN_EMOTIONS.get(mapped_emotion, EKMAN_EMOTIONS['neutral'])
+                    face_feat[idx] = score / 100.0  # Normalize to [0,1]
+                    
+                face_tensor = torch.tensor(face_feat.astype(np.float32))
+                
             except Exception as e:
-                face_feat = np.zeros(7)
-                face_tensor = torch.tensor(face_feat).unsqueeze(0)
+                # print(f"Face analysis error: {str(e)}")  # Uncomment for debugging
+                face_feat = np.zeros(len(EKMAN_EMOTIONS))
+                face_feat[EKMAN_EMOTIONS['neutral']] = 1.0  # Default to neutral
+                face_tensor = torch.tensor(face_feat.astype(np.float32))
                 face_conf = 0.0
-                dominant_emotion = "unknown"
+                dominant_emotion = "no_face"
 
-            # 2. SPEECH EMOTION PREDICTION (Wav2Vec 2.0 + Classifier)
-            with torch.no_grad():
-                inputs = processor(audio_chunk, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-                outputs = wav2vec_model(**inputs)
-
-                # Original embedding for fusion model (shape: [1, 768])
-                speech_embedding_for_fusion = outputs.last_hidden_state.mean(dim=1)
-
-                # Reshaped embedding for CNN classifier (shape: [1, 768, 1])
-                speech_embedding_for_classifier = speech_embedding_for_fusion.unsqueeze(-1)
-
-                # Classify using CNN
-                speech_logits = speech_classifier(speech_embedding_for_classifier)
-                speech_pred_idx = torch.argmax(speech_logits, dim=1).item()
-                speech_conf = torch.max(speech_logits).item()
-                speech_emotion = EMOTION_LABELS[speech_pred_idx]
+            # 2. SPEECH EMOTION PREDICTION using fine-tuned Wav2Vec2
+            try:
+                with torch.no_grad():
+                    # Process audio with the feature extractor
+                    inputs = feature_extractor(
+                        audio_chunk, 
+                        sampling_rate=SAMPLE_RATE, 
+                        return_tensors="pt", 
+                        padding=True
+                    )
+                    
+                    if inputs is None:
+                        raise ValueError("Feature extraction failed")
+                    
+                    # Get emotion predictions
+                    outputs = speech_model(**inputs)
+                    speech_logits = outputs.logits
+                    speech_probs = torch.nn.functional.softmax(speech_logits, dim=-1)
+                    
+                    # Create emotion distribution tensor matching Ekman emotions
+                    speech_feat = torch.zeros(len(EKMAN_EMOTIONS))
+                    
+                    # Map RAVDESS probabilities to Ekman emotions
+                    for idx, ravdess_emotion in id2label.items():
+                        ekman_emotion = EMOTION_MAPPING.get(ravdess_emotion, 'neutral')
+                        ekman_idx = EKMAN_EMOTIONS.get(ekman_emotion, EKMAN_EMOTIONS['neutral'])
+                        speech_feat[ekman_idx] += speech_probs[0, idx].item()
+                    
+                    # Normalize to ensure sum to 1
+                    speech_feat = speech_feat / speech_feat.sum() if speech_feat.sum() > 0 else speech_feat
+                    
+                    # Use this as our speech embedding for fusion
+                    speech_embedding_for_fusion = speech_feat.unsqueeze(0)  # Shape: [1, 7]
+                    
+                    # Get prediction and confidence for display
+                    speech_pred_idx = torch.argmax(speech_logits, dim=-1).item()
+                    speech_conf = torch.max(speech_probs).item()
+                    
+                    # Map emotion for display
+                    ravdess_emotion = id2label.get(speech_pred_idx, 'neutral')
+                    speech_emotion = EMOTION_MAPPING.get(ravdess_emotion, 'neutral')
+                        
+                    # Map the emotion for display purposes
+                    ravdess_emotion = id2label.get(speech_pred_idx, 'neutral')
+                    speech_emotion = EMOTION_MAPPING.get(ravdess_emotion, 'neutral')
+                    
+            except Exception as e:
+                print(f"Speech processing error: {str(e)}")
+                # Fallback to neutral emotion distribution
+                speech_feat = torch.zeros(len(EKMAN_EMOTIONS))
+                speech_feat[EKMAN_EMOTIONS['neutral']] = 1.0  # All probability on neutral
+                speech_embedding_for_fusion = speech_feat.unsqueeze(0)  # Shape: [1, 7]
+                speech_conf = 0.0
+                speech_emotion = 'neutral'
 
             # 3. FUSION WITH ATTENTION
             with torch.no_grad():
@@ -287,7 +445,7 @@ if __name__ == "__main__":
             time.sleep(0.01)  # Reduce CPU usage
 
     except KeyboardInterrupt:
-    print("\nStopping... Goodbye!")
+        print("\nStopping... Goodbye!")
 
     # Cleanup
     cv2.destroyAllWindows()
