@@ -22,10 +22,10 @@ FACE_EMOTION_MAP = {
 AUDIO_EMOTION_MAP = {
     "angry": "anger",
     "disgust": "disgust",
-    "fearful": "fear",
+    "fear": "fear",
     "happy": "happiness",
     "sad": "sadness",
-    "surprised": "surprise",
+    "surprise": "surprise",
     "neutral": "neutral",
     "calm": "neutral",
 }
@@ -33,15 +33,20 @@ AUDIO_EMOTION_MAP = {
 # -----------------------------
 # Load models
 # -----------------------------
-print("Loading audio model...")
-audio_classifier = pipeline("audio-classification", model="superb/hubert-large-superb-er")
+print("Loading speech emotion model (wav2vec2)...")
+audio_classifier = pipeline(
+    "audio-classification",
+    model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+)
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+print("Loading face detector...")
+# DeepFace will internally load RetinaFace by default
+# We'll set backend explicitly for consistency
+FACE_BACKEND = "retinaface"
 
 # Shared state
 audio_label = {"value": "neutral"}
 audio_lock = threading.Lock()
-
 
 # -----------------------------
 # Fusion Rule
@@ -56,7 +61,6 @@ def fuse_emotions(face, audio):
     if audio == "neutral" and face and face != "neutral":
         return face
     return audio or face
-
 
 # -----------------------------
 # Audio Worker (threaded)
@@ -90,7 +94,6 @@ def audio_worker():
     with sd.InputStream(channels=1, samplerate=16000, callback=callback):
         sd.sleep(int(1e12))  # keep alive
 
-
 # -----------------------------
 # Start audio thread
 # -----------------------------
@@ -114,23 +117,20 @@ while True:
 
     # Run face detection every 10th frame
     if frame_count % 10 == 0:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        if len(faces) > 0:
-            x, y, w, h = faces[0]
-            roi = frame[y:y + h, x:x + w]
-            try:
-                result = DeepFace.analyze(
-                    roi,
-                    actions=["emotion"],
-                    detector_backend="opencv",
-                    enforce_detection=False,
-                    silent=True
-                )
-                face_label = FACE_EMOTION_MAP.get(result[0]["dominant_emotion"].lower(), "neutral")
-            except Exception:
-                pass
+        try:
+            result = DeepFace.analyze(
+                frame,
+                actions=["emotion"],
+                detector_backend=FACE_BACKEND,
+                enforce_detection=False,
+                silent=True
+            )
+            face_label = FACE_EMOTION_MAP.get(
+                result[0]["dominant_emotion"].lower(), "neutral"
+            )
+        except Exception as e:
+            print("Face error:", e)
+            face_label = "neutral"
 
     # Get audio label safely
     with audio_lock:
