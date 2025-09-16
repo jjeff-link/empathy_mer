@@ -29,201 +29,94 @@ CONFIG = {
     "max_face_tracking_frames": 10,  # Track face for up to 10 frames before re-detecting
 }
 
-# -----------------------------
-# Emotion Mappings (Ekman + Neutral)
-# -----------------------------
-FACE_EMOTION_MAP = {
-    "angry": "anger",
-    "disgust": "disgust",
-    "fear": "fear",
-    "happy": "happiness",
-    "sad": "sadness",
-    "surprise": "surprise",
-    "neutral": "neutral",
-}
+# Emotion mappings and similarity rules
+FACE_EMOTION_MAP = {"angry": "anger", "disgust": "disgust", "fear": "fear", "happy": "happiness", "sad": "sadness", "surprise": "surprise", "neutral": "neutral"}
 
 AUDIO_EMOTION_MAP = {
-    # Original model mappings
-    "angry": "anger",
-    "anger": "anger",
-    "disgust": "disgust", 
-    "fear": "fear",
-    "happy": "happiness",
-    "happiness": "happiness",
-    "joy": "happiness",
-    "sad": "sadness",
-    "sadness": "sadness",
-    "surprise": "surprise",
-    "neutral": "neutral",
-    
-    # SuperB model mappings (more reliable)
-    "ang": "anger",      # anger
-    "hap": "happiness",  # happiness  
-    "neu": "neutral",    # neutral
-    "sad": "sadness",    # sadness
-    
-    # Additional common variations
-    "fearful": "fear",
-    "joyful": "happiness",
+    # Standard mappings
+    "angry": "anger", "anger": "anger", "disgust": "disgust", "fear": "fear", "happy": "happiness", "happiness": "happiness", 
+    "joy": "happiness", "sad": "sadness", "sadness": "sadness", "surprise": "surprise", "neutral": "neutral",
+    # SuperB model mappings
+    "ang": "anger", "hap": "happiness", "neu": "neutral", "sad": "sadness",
+    # Additional variations
+    "fearful": "fear", "joyful": "happiness",
 }
 
-# Model-specific emotion processing
+AUDIO_CONFIDENCE_THRESHOLD = 0.1
+EMOTION_SIMILARITY_MAP = {
+    ("anger", "sadness"): "anger", ("sadness", "anger"): "anger", ("fear", "sadness"): "sadness", 
+    ("sadness", "fear"): "sadness", ("happiness", "neutral"): "happiness", ("neutral", "happiness"): "happiness",
+}
+
 def process_audio_emotions(predictions, model_name):
     """Process audio emotion predictions based on the model used"""
-    
-    if "superb" in model_name.lower():
-        # SuperB model gives more confident predictions, use different thresholds
-        filtered_preds = []
-        for pred in predictions:
-            if pred["score"] > 0.05:  # Lower threshold for SuperB model
-                emotion = AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"])
-                filtered_preds.append({"label": emotion, "score": pred["score"]})
-        
-        # Sort by confidence
-        filtered_preds.sort(key=lambda x: x["score"], reverse=True)
-        return filtered_preds if filtered_preds else [{"label": "neutral", "score": 0.5}]
-    
-    else:
-        # Original model processing (less confident predictions)
-        filtered_preds = []
-        for pred in predictions:
-            emotion = AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"])
-            filtered_preds.append({"label": emotion, "score": pred["score"]})
-        
-        return filtered_preds# Audio confidence thresholds to improve accuracy
-AUDIO_CONFIDENCE_THRESHOLD = 0.1  # Much lower threshold to accept more predictions
-EMOTION_SIMILARITY_MAP = {
-    # Map similar emotions that might be confused
-    ("anger", "sadness"): "anger",  # Prioritize anger when confused with sadness
-    ("sadness", "anger"): "anger",  # Same for reverse
-    ("fear", "sadness"): "sadness", # Prioritize sadness when confused with fear
-    ("sadness", "fear"): "sadness", # Same for reverse
-    ("happiness", "neutral"): "happiness",  # Prioritize happiness over neutral
-    ("neutral", "happiness"): "happiness",  # Same for reverse
-}
+    threshold = 0.05 if "superb" in model_name.lower() else 0.0
+    filtered_preds = [{"label": AUDIO_EMOTION_MAP.get(pred["label"].lower(), pred["label"]), "score": pred["score"]} 
+                     for pred in predictions if pred["score"] > threshold]
+    filtered_preds.sort(key=lambda x: x["score"], reverse=True)
+    return filtered_preds or [{"label": "neutral", "score": 0.5}]
 
-# Audio preprocessing functions
 def preprocess_audio(audio_segment):
     """Enhanced audio preprocessing for better emotion recognition"""
-    if not CONFIG["audio_enhancement"]:
+    if not CONFIG["audio_enhancement"] or np.max(np.abs(audio_segment)) < 1e-6:
         return audio_segment
     
-    # Check if audio has any signal
-    if np.max(np.abs(audio_segment)) < 1e-6:
-        return audio_segment
-    
-    # Normalize audio (less aggressive)
+    # Normalize audio
     max_val = np.max(np.abs(audio_segment))
     audio_segment = audio_segment / (max_val + 1e-8)
     
-    # Apply simple high-pass filter instead of bandpass to preserve more signal
-    # Remove very low frequencies but keep most of the signal
+    # Apply high-pass filter if segment is long enough
     if len(audio_segment) > 100:
         try:
-            nyquist = 16000 / 2.0  # Use float division
-            low_freq = 50.0  # Hz
-            normalized_freq = low_freq / nyquist
-            
-            # Ensure frequency is in valid range (0 < Wn < 1)
+            normalized_freq = 50.0 / (16000 / 2.0)  # 50Hz high-pass
             if 0 < normalized_freq < 1:
                 b, a = scipy.signal.butter(2, normalized_freq, btype='high')
                 audio_segment = scipy.signal.filtfilt(b, a, audio_segment)
-            else:
-                # Skip filtering if frequency is invalid
-                pass
         except Exception as e:
-            # If filtering fails, just return the normalized audio
             print(f"Filter warning: {e}")
     
     return audio_segment
 
-# -----------------------------
 # Load models
-# -----------------------------
 print("=== Performance Configuration ===")
 for key, value in CONFIG.items():
     print(f"{key}: {value}")
 print("=================================")
 
-print("Loading speech emotion model (wav2vec2)...")
-# Try multiple models in order of preference
+# Load audio emotion model
 audio_classifier = None
 current_audio_model = None
-models_to_try = [
-    ("superb/wav2vec2-base-superb-er", "SuperB emotion recognition model"),
-    ("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", "Original emotion model"),
-]
+models_to_try = [("superb/wav2vec2-base-superb-er", "SuperB emotion recognition model"), 
+                 ("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", "Original emotion model")]
 
-use_gpu = CONFIG["use_gpu"] and __import__("torch").cuda.is_available()
-device = 0 if use_gpu else -1
+device = 0 if CONFIG["use_gpu"] and __import__("torch").cuda.is_available() else -1
 
 for model_name, description in models_to_try:
     try:
-        print(f"Trying {description}...")
-        audio_classifier = pipeline(
-            "audio-classification",
-            model=model_name,
-            device=device
-        )
-        print(f"{description} loaded successfully on {'GPU' if use_gpu else 'CPU'}")
+        print(f"Loading {description}...")
+        audio_classifier = pipeline("audio-classification", model=model_name, device=device)
+        print(f"{description} loaded successfully on {'GPU' if device >= 0 else 'CPU'}")
         current_audio_model = model_name
         break
     except Exception as e:
         print(f"Failed to load {description}: {e}")
-        continue
 
 if audio_classifier is None:
     print("ERROR: Could not load any audio emotion model!")
     exit(1)
 
-print("Loading face detector...")
-# Use configurable backend for balance between speed and accuracy
-FACE_BACKEND = CONFIG["face_backend"]
+# Load face detector
+print(f"Initializing DeepFace with {CONFIG['face_backend']} backend...")
+try:
+    test_image = np.zeros((100, 100, 3), dtype=np.uint8)
+    _ = DeepFace.analyze(test_image, actions=["emotion"], detector_backend=CONFIG["face_backend"], enforce_detection=False, silent=True)
+    print(f"Successfully initialized {CONFIG['face_backend']} backend")
+except Exception as e:
+    print(f"Failed to initialize face detection: {e}")
+    exit(1)
 
-print("Initializing DeepFace models (this may take a moment)...")
-print(f"Trying {FACE_BACKEND} backend...")
-
-# Test different backends to find the most reliable one
-backend_options = ["opencv", "ssd", "retinaface", "dlib"]  # Reorder for performance
-
-successful_backend = None
-
-for backend in backend_options:
-    try:
-        print(f"Testing {backend} backend...")
-        # Initialize with a small test image to pre-load models
-        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
-        _ = DeepFace.analyze(
-            test_image,
-            actions=["emotion"],
-            detector_backend=backend,
-            enforce_detection=False,
-            silent=True
-        )
-        print(f"Successfully initialized {backend} backend")
-        FACE_BACKEND = backend
-        successful_backend = backend
-        break
-    except Exception as e:
-        print(f"Failed {backend}: {e}")
-        continue
-
-if successful_backend is None:
-    print("WARNING: Could not initialize any face detection backend, using opencv as fallback")
-    FACE_BACKEND = "opencv"
-else:
-    print(f"Using face detection backend: {FACE_BACKEND}")
-
-# Performance tracking
-performance_stats = {
-    "frame_count": 0,
-    "face_detection_time": deque(maxlen=50),
-    "audio_processing_time": deque(maxlen=50),
-    "fps": 0,
-    "last_fps_time": time.time()
-}
-
-# Shared state
+# Performance tracking and shared state
+performance_stats = {"frame_count": 0, "face_detection_time": deque(maxlen=50), "audio_processing_time": deque(maxlen=50), "fps": 0, "last_fps_time": time.time()}
 audio_label = {"value": "neutral", "confidence": 0.0, "raw_predictions": [], "audio_stats": {}}
 audio_lock = threading.Lock()
 
@@ -231,10 +124,8 @@ audio_lock = threading.Lock()
 last_face_detection = 0
 face_detection_interval = CONFIG["face_detection_interval"]
 last_known_face_bbox = None
-skip_frame_count = 0  # For adaptive frame skipping
-current_face_region = None  # Store current face bounding box
-
-# Face tracking for performance optimization
+skip_frame_count = 0
+current_face_region = None
 face_tracker = None
 face_tracking_frames = 0
 last_face_emotion = "neutral"
@@ -475,7 +366,7 @@ while True:
             result = DeepFace.analyze(
                 analysis_frame,
                 actions=["emotion"],
-                detector_backend=FACE_BACKEND,
+                detector_backend=CONFIG["face_backend"],
                 enforce_detection=False,
                 silent=True
             )
