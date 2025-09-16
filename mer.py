@@ -12,18 +12,21 @@ import scipy.signal
 # Performance Configuration
 # -----------------------------
 CONFIG = {
-    "face_backend": "opencv",  # "opencv" (fast) or "retinaface" (accurate)
-    "face_detection_interval": 0.5,  # seconds between face detections
-    "audio_processing_interval": 1.5,  # Reduced to 1.5 seconds for more responsive audio
+    "face_backend": "opencv",  # Use faster opencv backend for better performance
+    "face_detection_interval": 1.0,  # Slower detection for better performance - track in between
+    "audio_processing_interval": 2.0,  # Slower audio processing to reduce overhead
     "use_gpu": True,  # Use GPU if available
-    "resize_for_face_detection": True,  # Resize frames for faster face detection
+    "resize_for_face_detection": True,  # Enable resizing for faster processing
     "adaptive_frame_skip": True,  # Skip frames when FPS is low
     "camera_width": 640,
     "camera_height": 480,
     "camera_fps": 30,
-    "audio_debug": True,  # Enable detailed audio debugging
+    "audio_debug": False,  # Disable debugging for better performance
     "audio_enhancement": False,  # Disable audio preprocessing to avoid filter issues
     "simple_mode": True,  # Use simpler logic for testing
+    "face_debug": False,  # Disable face debugging for performance
+    "face_tracking": True,  # Enable face tracking between detections
+    "max_face_tracking_frames": 10,  # Track face for up to 10 frames before re-detecting
 }
 
 # -----------------------------
@@ -177,34 +180,39 @@ print("Loading face detector...")
 # Use configurable backend for balance between speed and accuracy
 FACE_BACKEND = CONFIG["face_backend"]
 
-# Pre-load DeepFace models to avoid segmentation faults
 print("Initializing DeepFace models (this may take a moment)...")
-try:
-    # Initialize with a small test image to pre-load models
-    test_image = np.zeros((100, 100, 3), dtype=np.uint8)
-    _ = DeepFace.analyze(
-        test_image,
-        actions=["emotion"],
-        detector_backend=FACE_BACKEND,
-        enforce_detection=False,
-        silent=True
-    )
-    print(f"DeepFace initialized successfully with {FACE_BACKEND} backend")
-except Exception as e:
-    print(f"Error initializing DeepFace with {FACE_BACKEND}, trying opencv backend...")
-    FACE_BACKEND = "opencv"
+print(f"Trying {FACE_BACKEND} backend...")
+
+# Test different backends to find the most reliable one
+backend_options = ["opencv", "ssd", "retinaface", "dlib"]  # Reorder for performance
+
+successful_backend = None
+
+for backend in backend_options:
     try:
+        print(f"Testing {backend} backend...")
+        # Initialize with a small test image to pre-load models
+        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         _ = DeepFace.analyze(
             test_image,
             actions=["emotion"],
-            detector_backend=FACE_BACKEND,
+            detector_backend=backend,
             enforce_detection=False,
             silent=True
         )
-        print(f"DeepFace initialized successfully with opencv backend")
-    except Exception as e2:
-        print(f"Failed to initialize DeepFace: {e2}")
-        print("Face detection will be disabled")
+        print(f"✓ Successfully initialized {backend} backend")
+        FACE_BACKEND = backend
+        successful_backend = backend
+        break
+    except Exception as e:
+        print(f"✗ Failed {backend}: {e}")
+        continue
+
+if successful_backend is None:
+    print("WARNING: Could not initialize any face detection backend, using opencv as fallback")
+    FACE_BACKEND = "opencv"
+else:
+    print(f"Using face detection backend: {FACE_BACKEND}")
 
 # Performance tracking
 performance_stats = {
@@ -225,6 +233,11 @@ face_detection_interval = CONFIG["face_detection_interval"]
 last_known_face_bbox = None
 skip_frame_count = 0  # For adaptive frame skipping
 current_face_region = None  # Store current face bounding box
+
+# Face tracking for performance optimization
+face_tracker = None
+face_tracking_frames = 0
+last_face_emotion = "neutral"
 
 # -----------------------------
 # Improved Fusion Rule with confidence
@@ -276,45 +289,23 @@ def audio_worker():
         if len(buffer) >= 32000 and (now - last_pred_time > CONFIG["audio_processing_interval"]):
             start_time = time.time()
             segment = np.array(buffer[:32000])
-            del buffer[:16000]  # More overlap for better analysis
+            del buffer[:24000]  # Less overlap for better performance
             
             try:
-                # Enhanced preprocessing (if enabled)
-                try:
-                    if CONFIG["audio_enhancement"]:
-                        processed_segment = preprocess_audio(segment)
-                    else:
-                        # Simple normalization only - more reliable
-                        max_val = np.max(np.abs(segment))
-                        if max_val > 1e-8:
-                            processed_segment = segment / max_val
-                            # Ensure audio is in the right range for the model
-                            processed_segment = np.clip(processed_segment, -1.0, 1.0)
-                        else:
-                            processed_segment = segment
-                except Exception as filter_error:
-                    print(f"Audio preprocessing error: {filter_error}")
-                    # Fallback to simple normalization
-                    max_val = np.max(np.abs(segment))
-                    processed_segment = segment / (max_val + 1e-8) if max_val > 1e-8 else segment
+                # Simplified preprocessing for performance
+                max_val = np.max(np.abs(segment))
+                if max_val > 1e-8:
+                    processed_segment = segment / max_val
+                    processed_segment = np.clip(processed_segment, -1.0, 1.0)
+                else:
+                    processed_segment = segment
                 
-                # Calculate audio statistics for debugging
+                # Simplified audio quality detection
                 audio_volume = np.sqrt(np.mean(processed_segment**2))
-                audio_energy = np.sum(processed_segment**2)
-                audio_peak = np.max(np.abs(processed_segment))
                 
-                # Improved audio quality detection
-                # Check for actual speech characteristics
-                is_speech_like = (
-                    audio_volume > 0.002 and  # Minimum volume threshold
-                    audio_peak > 0.01 and    # Minimum peak amplitude
-                    audio_energy > 0.1       # Minimum energy
-                )
-                
-                if not is_speech_like:
-                    if CONFIG["audio_debug"]:
-                        print(f"Audio quality insufficient - Volume: {audio_volume:.6f}, Peak: {audio_peak:.4f}, Energy: {audio_energy:.4f}")
-                    # Don't update audio label if quality is too poor
+                # Simple speech detection threshold
+                if audio_volume < 0.005:
+                    # Don't update audio label if too quiet
                     processing_time = time.time() - start_time
                     performance_stats["audio_processing_time"].append(processing_time)
                     last_pred_time = now
@@ -331,7 +322,7 @@ def audio_worker():
                 if CONFIG["audio_debug"]:
                     print(f"\n=== AUDIO DEBUG ===")
                     print(f"Model: {current_audio_model}")
-                    print(f"Volume: {audio_volume:.4f}, Peak: {audio_peak:.4f}, Energy: {audio_energy:.2f}")
+                    print(f"Volume: {audio_volume:.4f}")
                     print(f"Raw predictions:")
                     for i, pred in enumerate(raw_preds):
                         print(f"  {i+1}. {pred['label']} (confidence: {pred['score']:.3f})")
@@ -404,9 +395,6 @@ def audio_worker():
                     audio_label["processed_predictions"] = [(p["label"], p["score"]) for p in preds]
                     audio_label["audio_stats"] = {
                         "volume": audio_volume,
-                        "energy": audio_energy,
-                        "peak": audio_peak,
-                        "is_speech_like": is_speech_like,
                     }
                 
                 # Track performance
@@ -452,7 +440,7 @@ while True:
     current_time = time.time()
     
     # Adaptive frame skipping based on performance
-    if CONFIG["adaptive_frame_skip"] and performance_stats["fps"] < 15 and skip_frame_count < 2:
+    if CONFIG["adaptive_frame_skip"] and performance_stats["fps"] < 20 and skip_frame_count < 3:
         skip_frame_count += 1
         continue
     else:
@@ -465,16 +453,21 @@ while True:
         performance_stats["last_fps_time"] = current_time
     performance_stats["frame_count"] += 1
 
-    # Run face detection based on time interval instead of frame count
-    if current_time - last_face_detection >= face_detection_interval:
+    # Improved face detection with tracking
+    should_detect_face = (
+        current_time - last_face_detection >= face_detection_interval or
+        (CONFIG["face_tracking"] and face_tracking_frames >= CONFIG["max_face_tracking_frames"])
+    )
+    
+    if should_detect_face:
         face_detection_start = time.time()
         try:
-            # Optionally resize frame for faster processing
+            # Always resize frame for faster processing
             if CONFIG["resize_for_face_detection"]:
                 small_frame = cv2.resize(frame, (320, 240))
                 analysis_frame = small_frame
-                scale_x = frame.shape[1] / 320  # Scale factor for x coordinates
-                scale_y = frame.shape[0] / 240  # Scale factor for y coordinates
+                scale_x = frame.shape[1] / 320
+                scale_y = frame.shape[0] / 240
             else:
                 analysis_frame = frame
                 scale_x = scale_y = 1.0
@@ -487,20 +480,39 @@ while True:
                 silent=True
             )
             
-            face_label = FACE_EMOTION_MAP.get(
-                result[0]["dominant_emotion"].lower(), "neutral"
-            )
-            
-            # Extract face region information if available
-            if "region" in result[0]:
-                region = result[0]["region"]
-                # Scale coordinates back to original frame size if we resized
-                x = int(region["x"] * scale_x)
-                y = int(region["y"] * scale_y)
-                w = int(region["w"] * scale_x)
-                h = int(region["h"] * scale_y)
-                current_face_region = (x, y, w, h)
+            # Process results with reduced debugging
+            if result and len(result) > 0:
+                emotions = result[0]["emotion"]
+                dominant_emotion = result[0]["dominant_emotion"].lower()
+                
+                # Simplified anti-neutral bias
+                if dominant_emotion == "neutral":
+                    sorted_emotions = sorted(emotions.items(), key=lambda x: x[1], reverse=True)
+                    if len(sorted_emotions) > 1:
+                        second_emotion, second_score = sorted_emotions[1]
+                        if second_score > 20.0:
+                            dominant_emotion = second_emotion.lower()
+                
+                face_label = FACE_EMOTION_MAP.get(dominant_emotion, "neutral")
+                last_face_emotion = face_label
+                
+                # Extract face region for tracking
+                if "region" in result[0]:
+                    region = result[0]["region"]
+                    x = int(region["x"] * scale_x)
+                    y = int(region["y"] * scale_y)
+                    w = int(region["w"] * scale_x)
+                    h = int(region["h"] * scale_y)
+                    current_face_region = (x, y, w, h)
+                    
+                    # Initialize simple tracking if enabled
+                    if CONFIG["face_tracking"]:
+                        face_tracking_frames = 0
+                else:
+                    current_face_region = None
+                    
             else:
+                face_label = "neutral"
                 current_face_region = None
                 
             last_face_detection = current_time
@@ -510,10 +522,17 @@ while True:
             performance_stats["face_detection_time"].append(detection_time)
             
         except Exception as e:
-            # print("Face error:", e)  # Reduce console spam
             face_label = "neutral"
             current_face_region = None
             last_face_detection = current_time
+    
+    else:
+        # Use face tracking between detections
+        if CONFIG["face_tracking"] and current_face_region is not None:
+            face_tracking_frames += 1
+            face_label = last_face_emotion  # Use last known emotion
+        else:
+            face_label = "neutral"
 
     # Get audio label safely
     with audio_lock:
@@ -533,44 +552,31 @@ while True:
         cv2.putText(frame, "FACE", (x, y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # Display text with performance info
+    # Display text with performance info  
     cv2.putText(frame, f"Face: {face_label}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
     cv2.putText(frame, f"Speech: {al} ({audio_conf:.2f})", (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     cv2.putText(frame, f"Final: {final_emotion}", (10, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
     
-    # Audio debugging info on screen
-    if audio_stats:
+    # Simplified audio info
+    if audio_stats and CONFIG["audio_debug"]:
         volume = audio_stats.get("volume", 0)
         cv2.putText(frame, f"Vol: {volume:.3f}", (10, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        
-        # Show top emotion scores
-        emotion_scores = audio_stats.get("emotion_scores", {})
-        y_offset = 150
-        for emotion, score in sorted(emotion_scores.items(), key=lambda x: x[1], reverse=True)[:3]:
-            cv2.putText(frame, f"{emotion}: {score:.2f}", (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            y_offset += 20
     
     # Performance display
-    cv2.putText(frame, f"FPS: {performance_stats['fps']}", (10, 230),
+    cv2.putText(frame, f"FPS: {performance_stats['fps']}", (10, 160),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    if performance_stats["face_detection_time"]:
-        avg_face_time = np.mean(performance_stats["face_detection_time"]) * 1000
-        cv2.putText(frame, f"Face Det: {avg_face_time:.1f}ms", (10, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    # Show face tracking status
+    if CONFIG["face_tracking"] and face_tracking_frames > 0:
+        cv2.putText(frame, f"Tracking: {face_tracking_frames}/{CONFIG['max_face_tracking_frames']}", (10, 190),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
     
-    if performance_stats["audio_processing_time"]:
-        avg_audio_time = np.mean(performance_stats["audio_processing_time"]) * 1000
-        cv2.putText(frame, f"Audio: {avg_audio_time:.1f}ms", (10, 290),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    # Instructions
-    cv2.putText(frame, "Press 'd' to toggle debug, 's' for simple mode, 'q' to quit", (10, frame.shape[0] - 20),
+    # Instructions (simplified)
+    cv2.putText(frame, "Press 'd'-debug, 'q'-quit", (10, frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     cv2.imshow("Multimodal Emotion Recognition", frame)
@@ -581,6 +587,9 @@ while True:
     elif key == ord("d"):
         CONFIG["audio_debug"] = not CONFIG["audio_debug"]
         print(f"Audio debug: {'ON' if CONFIG['audio_debug'] else 'OFF'}")
+    elif key == ord("f"):
+        CONFIG["face_debug"] = not CONFIG.get("face_debug", False)
+        print(f"Face debug: {'ON' if CONFIG['face_debug'] else 'OFF'}")
     elif key == ord("s"):
         CONFIG["simple_mode"] = not CONFIG["simple_mode"]
         print(f"Simple mode: {'ON' if CONFIG['simple_mode'] else 'OFF'}")
