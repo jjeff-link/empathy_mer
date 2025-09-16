@@ -165,11 +165,11 @@ for model_name, description in models_to_try:
             model=model_name,
             device=device
         )
-        print(f"✓ {description} loaded successfully on {'GPU' if use_gpu else 'CPU'}")
+        print(f"{description} loaded successfully on {'GPU' if use_gpu else 'CPU'}")
         current_audio_model = model_name
         break
     except Exception as e:
-        print(f"✗ Failed to load {description}: {e}")
+        print(f"Failed to load {description}: {e}")
         continue
 
 if audio_classifier is None:
@@ -200,12 +200,12 @@ for backend in backend_options:
             enforce_detection=False,
             silent=True
         )
-        print(f"✓ Successfully initialized {backend} backend")
+        print(f"Successfully initialized {backend} backend")
         FACE_BACKEND = backend
         successful_backend = backend
         break
     except Exception as e:
-        print(f"✗ Failed {backend}: {e}")
+        print(f"Failed {backend}: {e}")
         continue
 
 if successful_backend is None:
@@ -548,9 +548,6 @@ while True:
         x, y, w, h = current_face_region
         # Draw rectangle around face
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        # Add small label above the box
-        cv2.putText(frame, "FACE", (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     # Display text with performance info  
     cv2.putText(frame, f"Face: {face_label}", (10, 30),
