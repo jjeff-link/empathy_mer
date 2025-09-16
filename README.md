@@ -1,9 +1,9 @@
-# 🎭 Multimodal Emotion Recognition (MER) Framework
+# Multimodal Emotion Recognition (MER) App Prototype
 
 A high-performance **real-time multimodal emotion recognition system** that combines facial emotion detection and speech emotion recognition using state-of-the-art deep learning models.
 
 
-## 🏗️ **System Architecture**
+## **System Architecture**
 
 ### **Processing Pipeline**
 ```
